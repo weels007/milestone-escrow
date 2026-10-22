@@ -13,6 +13,26 @@ Unique patterns:
   3. Proof-of-delivery verification with SSRF/DNS-rebinding defense
   4. Score tolerance so independent LLM runs can reach consensus
   5. Address coercion for entry args (client sends addresses as strings)
+
+Safety properties (steward review round 2):
+  A. Trusted fetch path — proof URLs are restricted to an allowlist of
+     operator-controlled domains. The validator's HTTP client resolves the
+     hostname itself, so a proof submitter could otherwise point an
+     attacker-controlled domain at the validator's internal addresses
+     (DNS rebinding) between the safety check and the actual connection.
+     Pinning the connection to the validated IP is impossible on-chain:
+     the validator's URL validator rejects IP literals
+     (`TLD_FORBIDDEN`, measured on studionet), so the equivalent safe path
+     is an allowlist of domains whose DNS the submitter cannot control.
+     On top of that, every hop re-resolves after the fetch and requires
+     the address set to be unchanged and still public.
+  B. Guaranteed refund path — a funded escrow can never be stranded:
+       * permanent proof-fetch failure is recorded as status `fetch_failed`
+         (the consensus-agreed error is caught, not reverted), and the
+         funder can refund immediately via `refund_failed_escrow`;
+       * the worker may replace a failed proof with a working one;
+       * after the deadline, `reclaim_expired` refunds escrows in any
+         unsettled state (`open`, `proof_submitted`, `fetch_failed`).
 """
 
 import json
@@ -30,6 +50,7 @@ MAX_PROOF_CHARS = 2000
 MAX_MILESTONE_CHARS = 300
 MAX_DESCRIPTION_CHARS = 500
 MAX_URL_CHARS = 2048
+MAX_FAILURE_REASON_CHARS = 200
 MIN_SCORE = 60
 SCORE_TOLERANCE = 10
 
@@ -37,6 +58,21 @@ ERROR_LLM = "[LLM] "
 ERROR_EXTERNAL = "[EXTERNAL] "
 ERROR_TRANSIENT = "[TRANSIENT] "
 ERROR_EXPECTED = "[EXPECTED] "
+
+# Domains whose DNS zone is operated by a party other than the proof
+# submitter. Only these may be fetched, so the validator's own DNS
+# resolution can only ever land on public, submitter-independent addresses.
+# A host matches when it equals a suffix or is a subdomain of it.
+TRUSTED_FETCH_SUFFIXES = (
+    "example.com",
+    "github.com",
+    "githubusercontent.com",
+    "ipfs.io",
+    "dweb.link",
+    "arweave.net",
+    "wikipedia.org",
+    "iana.org",
+)
 
 
 def _now_ts() -> int:
@@ -241,6 +277,25 @@ def _host_is_blocked(host: str) -> bool:
     return _ip_is_blocked(ip)
 
 
+def _host_is_trusted(host: str) -> bool:
+    """True when the host belongs to an allowlisted, submitter-independent domain.
+
+    Only these hosts may be fetched: the validator's HTTP client performs its
+    own DNS resolution, so a submitter-controlled domain could be rebound to
+    the validator's internal addresses after the safety check. Allowing only
+    domains whose DNS zone the submitter does not control removes that path
+    (IP pinning is not possible on-chain: the validator's URL validator
+    rejects IP literals with TLD_FORBIDDEN).
+    """
+    host_l = (host or "").lower().rstrip(".")
+    if not host_l:
+        return False
+    for suffix in TRUSTED_FETCH_SUFFIXES:
+        if host_l == suffix or host_l.endswith("." + suffix):
+            return True
+    return False
+
+
 def _validate_url(url: str) -> bool:
     if not url or len(url) > MAX_URL_CHARS:
         return False
@@ -290,6 +345,18 @@ def _pay_out(to, value: int) -> None:
     _EOA(to).emit_transfer(value=u256(value), on="finalized")
 
 
+def _is_permanent_failure(message: str) -> bool:
+    """True for failures that cannot be fixed by retrying the same proof.
+
+    `[EXPECTED]` (deterministic business error) and `[EXTERNAL]` (the
+    evidence is unavailable: 4xx, blocked host, host does not resolve) are
+    permanent. `[TRANSIENT]` (network/5xx) and `[LLM]` are retryable.
+    """
+    if not message:
+        return False
+    return message.startswith(ERROR_EXPECTED) or message.startswith(ERROR_EXTERNAL)
+
+
 def _score_proof(milestone: str, proof_content: str) -> int:
     prompt = f"""Score this proof of milestone delivery for an escrow contract.
 
@@ -328,6 +395,7 @@ class Escrow:
     status: str
     proof_score: u256
     created_ts: u256
+    failure_reason: str
 
 
 @allow_storage
@@ -376,6 +444,7 @@ class MilestoneEscrow(gl.Contract):
             status="open",
             proof_score=0,
             created_ts=u256(_now_ts()),
+            failure_reason="",
         )
         self.escrow_seq = self.escrow_seq + 1
         self.locked_total = self.locked_total + u256(value)
@@ -386,19 +455,21 @@ class MilestoneEscrow(gl.Contract):
         if escrow_id not in self.escrows:
             raise gl.vm.UserError("escrow not found")
         escrow = self.escrows[escrow_id]
-        if escrow.status != "open":
+        if escrow.status not in ("open", "fetch_failed"):
             raise gl.vm.UserError("escrow not open")
         if _now_ts() > int(escrow.deadline):
             raise gl.vm.UserError("deadline passed")
         if not _validate_url(url):
             raise gl.vm.UserError("invalid url")
+        if not _host_is_trusted(_host_of(url) or ""):
+            raise gl.vm.UserError("url host is not on the trusted fetch allowlist")
         if not description or len(description) > MAX_DESCRIPTION_CHARS:
             raise gl.vm.UserError(f"description must be 1-{MAX_DESCRIPTION_CHARS} characters")
         sender = gl.message.sender_address
         if not _addr_eq(sender, escrow.worker):
             raise gl.vm.UserError("only worker can submit proof")
         proof_key = f"{escrow_id}:proof"
-        if proof_key in self.proofs:
+        if proof_key in self.proofs and escrow.status == "open":
             raise gl.vm.UserError("proof already submitted")
         worker_hex = _addr_hex(escrow.worker)
         sign_msg = f"MilestoneEscrow:proof:{escrow_id}:{url}:{description[:50]}"
@@ -413,6 +484,7 @@ class MilestoneEscrow(gl.Contract):
             submitted_ts=u256(_now_ts()),
         )
         escrow.status = "proof_submitted"
+        escrow.failure_reason = ""
         self.escrows[escrow_id] = escrow
 
     @gl.public.write
@@ -426,10 +498,24 @@ class MilestoneEscrow(gl.Contract):
         if proof_key not in self.proofs:
             raise gl.vm.UserError("proof not found")
         proof = self.proofs[proof_key]
-        result = _run_escrow_consensus(escrow_id, escrow, proof)
+        try:
+            result = _run_escrow_consensus(escrow_id, escrow, proof)
+        except gl.vm.UserError as e:
+            message = e.message if hasattr(e, "message") else str(e)
+            if not _is_permanent_failure(message):
+                # transient (network / 5xx / LLM): stay retryable, record nothing
+                raise
+            # The validators agreed on a permanent failure (for example the
+            # evidence URL is gone). Record it instead of reverting, so the
+            # funded escrow has a recovery path instead of being stranded.
+            escrow.status = "fetch_failed"
+            escrow.failure_reason = message[:MAX_FAILURE_REASON_CHARS]
+            self.escrows[escrow_id] = escrow
+            return
         self.locked_total = self.locked_total - escrow.amount
         escrow.proof_score = result["proof_score"]
         escrow.status = "released" if result["verified"] else "refunded"
+        escrow.failure_reason = ""
         self.escrows[escrow_id] = escrow
         target = escrow.worker if result["verified"] else escrow.funder
         _pay_out(target, int(escrow.amount))
@@ -450,12 +536,38 @@ class MilestoneEscrow(gl.Contract):
         _pay_out(escrow.funder, int(escrow.amount))
 
     @gl.public.write
-    def reclaim_expired(self, escrow_id: str) -> None:
+    def refund_failed_escrow(self, escrow_id: str) -> None:
+        """Refund an escrow whose proof could not be fetched permanently.
+
+        The funder recovers the deposit immediately — no need to wait for the
+        deadline — once consensus recorded a permanent proof-fetch failure.
+        """
         if escrow_id not in self.escrows:
             raise gl.vm.UserError("escrow not found")
         escrow = self.escrows[escrow_id]
-        if escrow.status != "open":
-            raise gl.vm.UserError("escrow not open")
+        if escrow.status != "fetch_failed":
+            raise gl.vm.UserError("escrow has no recorded fetch failure")
+        sender = gl.message.sender_address
+        if not _addr_eq(sender, escrow.funder):
+            raise gl.vm.UserError("only funder can refund")
+        self.locked_total = self.locked_total - escrow.amount
+        escrow.status = "refunded"
+        self.escrows[escrow_id] = escrow
+        _pay_out(escrow.funder, int(escrow.amount))
+
+    @gl.public.write
+    def reclaim_expired(self, escrow_id: str) -> None:
+        """Refund any unsettled escrow once its deadline has passed.
+
+        Covers every unsettled state — `open`, `proof_submitted` (proof
+        submitted but never verifiable) and `fetch_failed` — so a funded
+        escrow can never be stranded after its deadline.
+        """
+        if escrow_id not in self.escrows:
+            raise gl.vm.UserError("escrow not found")
+        escrow = self.escrows[escrow_id]
+        if escrow.status not in ("open", "proof_submitted", "fetch_failed"):
+            raise gl.vm.UserError("escrow already settled")
         if _now_ts() <= int(escrow.deadline):
             raise gl.vm.UserError("deadline not passed")
         sender = gl.message.sender_address
@@ -481,6 +593,7 @@ class MilestoneEscrow(gl.Contract):
             "status": e.status,
             "proof_score": int(e.proof_score),
             "created_ts": int(e.created_ts),
+            "failure_reason": e.failure_reason,
         }
 
     @gl.public.view
@@ -591,7 +704,12 @@ def _resolve_host_ips(host: str) -> list:
     return ips
 
 
-def _ensure_resolved_safe(host: str) -> None:
+def _ensure_resolved_safe(host: str) -> list:
+    """Resolve a hostname via DNS-over-HTTPS and require every address public.
+
+    Returns the validated address set so the caller can compare it with the
+    post-fetch resolution.
+    """
     ips = _resolve_host_ips(host)
     if not ips:
         raise gl.vm.UserError(ERROR_EXTERNAL + "host did not resolve")
@@ -602,6 +720,31 @@ def _ensure_resolved_safe(host: str) -> None:
             continue
         if _ip_is_blocked(ip):
             raise gl.vm.UserError(ERROR_EXTERNAL + "resolved address is blocked")
+    return ips
+
+
+def _ensure_resolution_unchanged(host: str, before: list) -> None:
+    """Re-resolve after the fetch and require the same, still-public addresses.
+
+    The validator's HTTP client resolves the hostname on its own, so the
+    address set can change between the safety check and the connection. This
+    check detects a rebinding that happened during the fetch window: the
+    content is discarded instead of being scored.
+    """
+    after = _resolve_host_ips(host)
+    if not after:
+        raise gl.vm.UserError(ERROR_EXTERNAL + "host did not resolve")
+    for raw in after:
+        try:
+            ip = ipaddress.ip_address(raw)
+        except ValueError:
+            continue
+        if _ip_is_blocked(ip):
+            raise gl.vm.UserError(ERROR_EXTERNAL + "resolved address is blocked")
+    before_set = set(before)
+    after_set = set(after)
+    if not (before_set & after_set):
+        raise gl.vm.UserError(ERROR_EXTERNAL + "dns changed during fetch")
 
 
 def _fetch_proof_evidence(url: str) -> str:
@@ -612,13 +755,16 @@ def _fetch_proof_evidence(url: str) -> str:
         host = _host_of(current)
         if not host:
             raise gl.vm.UserError(ERROR_EXTERNAL + "invalid redirect target")
-        _ensure_resolved_safe(host)
+        if not _host_is_trusted(host):
+            raise gl.vm.UserError(ERROR_EXTERNAL + "host is not on the trusted fetch allowlist")
+        resolved = _ensure_resolved_safe(host)
         try:
             res = gl.nondet.web.get(current)
         except gl.vm.UserError:
             raise
         except Exception:
             raise gl.vm.UserError(ERROR_TRANSIENT + "URL fetch failed")
+        _ensure_resolution_unchanged(host, resolved)
         status = int(res.status)
         if 300 <= status < 400:
             location = _header_value(res, "location")
